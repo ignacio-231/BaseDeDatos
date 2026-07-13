@@ -1,8 +1,9 @@
 from django import forms
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.forms import BaseFormSet, formset_factory
+from datetime import date
 
-from .models import AbonoCredito, Bodega, Categoria, Cliente, Empleado, Pedido, Producto
+from .models import AbonoCredito, Bodega, Categoria, Cliente, Empleado, Pedido, Producto, Proveedor
 
 
 class ClienteChoiceField(forms.ModelChoiceField):
@@ -40,64 +41,30 @@ class CategoriaChoiceField(forms.ModelMultipleChoiceField):
 
 
 class ProductoForm(forms.ModelForm):
-    sku = forms.CharField(
-        widget=forms.TextInput(attrs={"class": "form-control"}),
-        label="SKU",
-    )
-    nombre = forms.CharField(
-        widget=forms.TextInput(attrs={"class": "form-control"}),
-        label="Nombre",
-    )
-    precio = forms.IntegerField(
-        widget=forms.NumberInput(attrs={"class": "form-control"}),
-        label="Precio",
-    )
-    es_granel = forms.BooleanField(
-        required=False,
-        widget=forms.CheckboxInput(attrs={"class": "form-check-input"}),
-        label="Es a granel",
-    )
-    categorias = CategoriaChoiceField(
-        queryset=Categoria.objects.all().order_by("nombre"),
-        required=False,
-        widget=forms.SelectMultiple(attrs={"class": "form-control"}),
-        label="Categorías",
-    )
-
-    # NUEVOS CAMPOS AÑADIDOS PARA EL CONTROL DE STOCK
-    id_bodega = forms.ChoiceField(
-        choices=[],  # Se llena dinámicamente en el __init__
-        widget=forms.Select(attrs={"class": "form-control"}),
-        label="Bodega de Destino (Origen)",
-        error_messages={'required': 'Debe seleccionar una bodega para asignar el stock.'}
-    )
-    
-    cantidad_stock = forms.DecimalField(
-        max_digits=10,
-        decimal_places=3,
-        min_value=0,
-        widget=forms.NumberInput(attrs={"class": "form-control", "step": "0.001", "placeholder": "0.000"}),
-        label="Cantidad de Stock a Ingresar",
-    )
-
     class Meta:
         model = Producto
         fields = ["sku", "nombre", "precio", "es_granel", "categorias"]
+        widgets = {
+            "sku": forms.TextInput(attrs={"class": "form-control"}),
+            "nombre": forms.TextInput(attrs={"class": "form-control"}),
+            "precio": forms.NumberInput(attrs={"class": "form-control", "min": 0}),
+            "es_granel": forms.CheckboxInput(attrs={"class": "form-check-input"}),
+            "categorias": forms.SelectMultiple(attrs={"class": "form-control"}),
+        }
+        labels = {
+            "sku": "SKU / Código (No editable)",
+            "nombre": "Nombre del Producto",
+            "precio": "Precio ($)",
+            "es_granel": "¿Es a Granel?",
+            "categorias": "Categorías",
+        }
 
-    # Constructor para cargar las bodegas dinámicamente usando su clave compuesta como identificador
+    # CONSTRUCTOR NUEVO: Bloquea el SKU si ya existe el producto
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Creamos los choices usando "nombre_bodega|ubicacion_bodega" como el valor único del value=""
-        self.fields['id_bodega'].choices = [
-            (f"{b.nombre_bodega}|{b.ubicacion_bodega}", f"{b.nombre_bodega} ({b.ubicacion_bodega})")
-            for b in Bodega.objects.all().order_by("nombre_bodega")
-        ]
-
-    def clean_cantidad_stock(self):
-        cantidad = self.cleaned_data.get("cantidad_stock")
-        if cantidad is not None and cantidad < 0:
-            raise forms.ValidationError("La cantidad de stock no puede ser un valor negativo.")
-        return cantidad
+        # Si la instancia ya tiene un SKU guardado en la BD (estamos editando)
+        if self.instance and self.instance.pk:
+            self.fields['sku'].disabled = True  # Bloquea el campo en la interfaz y en el POST
 
 class ClienteCreateForm(forms.ModelForm):
     # CONSTANTES QUE TU VISTA (`views.py`) ESTÁ BUSCANDO:
@@ -260,10 +227,10 @@ class AbonoCreditoForm(forms.ModelForm):
     )
     metodo_pago = forms.ChoiceField(
         choices=(
-            ("Efectivo", "Efectivo"),
-            ("Transferencia", "Transferencia"),
-            ("Tarjeta", "Tarjeta"),
-            ("Cheque", "Cheque"),
+            ("efectivo", "Efectivo"),
+            ("transferencia", "Transferencia"),
+            ("tarjeta", "Tarjeta"),
+            ("cheque", "Cheque"),
         ),
         widget=forms.Select(attrs={"class": "form-control"}),
         label="Método de pago",
@@ -341,3 +308,52 @@ class BasePedidoLineaFormSet(BaseFormSet):
 
 
 PedidoLineaFormSet = formset_factory(PedidoLineaForm, formset=BasePedidoLineaFormSet, extra=1, can_delete=False, max_num=10)
+
+class LlegadaStockForm(forms.Form):
+    producto = forms.ModelChoiceField(
+        queryset=Producto.objects.all().order_by("nombre"),
+        widget=forms.Select(attrs={"class": "form-control"}),
+        label="Seleccionar Producto (SKU)",
+    )
+    
+    # Mantenemos el proveedor limpio (puedes dejarlo como ModelChoiceField si su RUT es único estricto)
+    proveedor = forms.ModelChoiceField(
+        queryset=Proveedor.objects.all(),
+        widget=forms.Select(attrs={"class": "form-control"}),
+        label="Proveedor que suministra",
+    )
+    
+    cantidad = forms.IntegerField(
+        min_value=1,
+        widget=forms.NumberInput(attrs={"class": "form-control", "step": "1"}),
+        label="Cantidad que llega",
+    )
+    
+    # CAMBIO AQUÍ: Usamos un ChoiceField normal para evitar el .get() automático de Django
+    bodega = forms.ChoiceField(
+        choices=[],  # Se cargan dinámicamente en el __init__
+        widget=forms.Select(attrs={"class": "form-control"}),
+        label="Bodega de Destino",
+    )
+    
+    fecha_llegada = forms.DateField(
+        widget=forms.DateInput(attrs={"class": "form-control", "type": "date"}),
+        label="Fecha de Llegada",
+        initial=date.today
+    )
+    
+    fecha_vencimiento = forms.DateField(
+        required=False,
+        widget=forms.DateInput(attrs={"class": "form-control", "type": "date"}),
+        label="Fecha de Vencimiento del Lote",
+    )
+
+    # Añadimos el constructor para rellenar las opciones con la clave compuesta (nombre|ubicacion)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .models import Bodega
+        # Generamos una lista de tuplas: ('nombre|ubicacion', 'nombre (ubicacion)')
+        self.fields['bodega'].choices = [
+            (f"{b.nombre_bodega}|{b.ubicacion_bodega}", f"{b.nombre_bodega} ({b.ubicacion_bodega})")
+            for b in Bodega.objects.all()
+        ]

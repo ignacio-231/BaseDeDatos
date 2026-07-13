@@ -122,6 +122,13 @@ LANGUAGE_CODE = 'es'
 
 TIME_ZONE = 'UTC'
 
+DATE_INPUT_FORMATS = [
+    '%d/%m/%Y',  # DD/MM/AAAA
+    '%Y-%m-%d',  # Mantiene compatibilidad estándar
+]
+
+DATE_FORMAT = 'd/m/Y'
+
 USE_I18N = True
 
 USE_TZ = True

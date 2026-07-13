@@ -1,6 +1,6 @@
 from django.apps import apps
 from django.contrib import messages
-from django.db import transaction
+from django.db import transaction, connection
 from django.core import signing
 from django.db.models import Max, Sum
 from django.core.exceptions import ObjectDoesNotExist
@@ -11,7 +11,7 @@ from django.db import IntegrityError
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
-from .forms import AbonoCreditoForm, ClienteCreateForm, PedidoCreateForm, PedidoLineaFormSet, ProductoForm
+from .forms import AbonoCreditoForm, ClienteCreateForm, PedidoCreateForm, PedidoLineaFormSet, ProductoForm, LlegadaStockForm
 from .models import (
     AbonoCredito,
     Cliente,
@@ -56,15 +56,32 @@ def _cliente_estado_financiero(cliente, today=None):
     limite = cliente.limite_credito or 0
     fecha_limite = cliente.fecha_limite
 
-    if saldo <= 0:
-        return "Sin deuda"
-    if fecha_limite and fecha_limite < today:
-        return "Vencido"
-    if limite and saldo >= limite:
-        return "Excedido"
-    if limite and saldo >= limite * Decimal("0.8"):
-        return "Cerca del límite"
-    return "Activo"
+    # 1. Si el cliente tiene un estado explícito de 'Bloqueado' (ej: por administración)
+    if cliente.id_estado and cliente.id_estado.nombre_estado.lower() == "bloqueado":
+        return "Bloqueado"
+
+    # 2. Si el saldo deudor sobrepasa el límite de crédito autorizado, se Bloquea automáticamente
+    if limite > 0 and saldo > limite:
+        return "Bloqueado"
+
+    # 3. LÓGICA INTERNA: Cerca del límite por muchos días
+    # Definimos que estar "cerca del límite" es haber usado el 90% o más del cupo
+    if limite > 0 and saldo >= (limite * 0.90):
+        # Asumiendo que guardas la fecha de cuándo empezó la deuda o cuándo se modificó el saldo,
+        # o usando la 'fecha_limite' como indicador de antigüedad de la cuenta corriente.
+        # Por ejemplo, si pasaron más de 15 días desde que se le otorgó/venció el crédito:
+        if fecha_limite:
+            dias_antiguedad = (today - fecha_limite).days
+            # Si lleva más de 7 días en esta situación de riesgo, pasa a Moroso de forma preventiva
+            if dias_antiguedad > 7:
+                return "Moroso"
+
+    # 4. Si la fecha límite de pago estándar ya pasó y el cliente aún tiene deuda
+    if saldo > 0 and fecha_limite and fecha_limite < today:
+        return "Moroso"
+
+    # 5. En cualquier otro caso, está Vigente
+    return "Vigente"
 
 
 def _cliente_resumen(cliente, today=None):
@@ -129,11 +146,18 @@ def _pedido_etiqueta(pedido):
 
 
 def _pedido_estado_label(estado):
-    estado_lower = (estado or "").lower()
-    if estado_lower == "terminado":
-        return "Terminado"
+    # Convertimos a minúsculas y eliminamos espacios extra
+    estado_lower = (estado or "").strip().lower()
+    
+    if estado_lower == "aprobado":
+        return "Aprobado"
+    if estado_lower == "pendiente":
+        return "Pendiente"
     if estado_lower == "rechazado":
         return "Rechazado"
+    if estado_lower == "terminado":
+        return "Terminado"
+        
     return "En proceso"
 
 
@@ -192,9 +216,12 @@ def _dashboard_context():
     pedidos = list(_pedido_queryset())
     abonos = list(_abono_queryset())
     cliente_resumenes = [_cliente_resumen(cliente, today=today) for cliente in clientes]
-    vencidos = [item for item in cliente_resumenes if item["estado_financiero"] == "Vencido"]
-    cerca_limite = [item for item in cliente_resumenes if item["estado_financiero"] == "Cerca del límite"]
-    excedidos = [item for item in cliente_resumenes if item["estado_financiero"] == "Excedido"]
+    
+    # Filtrados con los nuevos estados establecidos
+    morosos = [item for item in cliente_resumenes if item["estado_financiero"] == "Moroso"]
+    bloqueados = [item for item in cliente_resumenes if item["estado_financiero"] == "Bloqueado"]
+    vigentes = [item for item in cliente_resumenes if item["estado_financiero"] == "Vigente"]
+    
     total_deuda = sum((cliente.saldo_deudor or 0) for cliente in clientes)
     total_limite = sum((cliente.limite_credito or 0) for cliente in clientes)
     total_pagado = sum((abono.monto or 0) for abono in abonos)
@@ -205,9 +232,9 @@ def _dashboard_context():
         "total_deuda": total_deuda,
         "total_limite": total_limite,
         "total_pagado": total_pagado,
-        "vencidos": vencidos[:5],
-        "cerca_limite": cerca_limite[:5],
-        "excedidos": excedidos[:5],
+        "vencidos": morosos[:5],        # Mantiene compatibilidad con las variables de tu plantilla de dashboard
+        "excedidos": bloqueados[:5],    # Mantiene compatibilidad con tu plantilla de dashboard
+        "cerca_limite": [],             # Removido al simplificar a 3 estados
         "recent_pedidos": [_pedido_summary(pedido) for pedido in pedidos[:5]],
         "recent_abonos": [_abono_summary(abono) for abono in abonos[:5]],
     }
@@ -319,13 +346,54 @@ def home(request):
 
 def clientes_list(request):
     today = date.today()
-    clientes = [_cliente_resumen(cliente, today=today) for cliente in _cliente_queryset()]
+    
+    # 1. Capturar parámetros de la barra de filtros
+    q_search = request.GET.get('q', '').strip()
+    q_estado = request.GET.get('estado', '').strip()
+    q_orden = request.GET.get('orden', 'nombre_asc')  # Por defecto
+
+    # 2. Obtener todos los clientes base usando la optimización que ya tienes
+    clientes_qs = _cliente_queryset()
+    
+    # Aplicar filtro de texto (Nombre detallado o RUT)
+    # Como la consulta base trae objetos 'Cliente', primero preparamos sus resúmenes 
+    # para poder evaluar los estados financieros calculados dinámicamente y los nombres.
+    clientes_completos = []
+    for cliente in clientes_qs:
+        resumen = _cliente_resumen(cliente, today=today)
+        
+        # Filtrado por búsqueda de texto (RUT o Nombre calculado)
+        if q_search:
+            search_lower = q_search.lower()
+            if search_lower not in resumen["nombre"].lower() and search_lower not in cliente.rut.lower():
+                continue  # No calza con la búsqueda, saltar
+                
+        # Filtrado por Estado Financiero (Vigente, Moroso, Bloqueado)
+        if q_estado:
+            if resumen["estado_financiero"].lower() != q_estado.lower():
+                continue  # No calza con el estado seleccionado, saltar
+                
+        clientes_completos.append(resumen)
+
+    # 3. Aplicar Ordenamiento sobre la lista de Python
+    if q_orden == 'saldo_desc':
+        clientes_completos.sort(key=lambda x: x["obj"].saldo_deudor or 0, reverse=True)
+    elif q_orden == 'saldo_asc':
+        clientes_completos.sort(key=lambda x: x["obj"].saldo_deudor or 0)
+    elif q_orden == 'nombre_desc':
+        clientes_completos.sort(key=lambda x: x["nombre"], reverse=True)
+    else:  # 'nombre_asc'
+        clientes_completos.sort(key=lambda x: x["nombre"])
+
     return render(
         request,
         "clientes_list.html",
         {
-            "clientes": clientes,
+            "clientes": clientes_completos,
             "today": today,
+            "q_search": q_search,
+            "q_estado": q_estado,
+            "q_orden": q_orden,
         },
     )
 
@@ -496,20 +564,20 @@ def pedido_detail(request, id_pedido):
 def alertas_credito(request):
     today = date.today()
     clientes = [_cliente_resumen(cliente, today=today) for cliente in _cliente_queryset()]
-    vencidos = [item for item in clientes if item["estado_financiero"] == "Vencido"]
-    cerca_limite = [item for item in clientes if item["estado_financiero"] == "Cerca del límite"]
-    excedidos = [item for item in clientes if item["estado_financiero"] == "Excedido"]
+    
+    morosos = [item for item in clientes if item["estado_financiero"] == "Moroso"]
+    bloqueados = [item for item in clientes if item["estado_financiero"] == "Bloqueado"]
+    
     return render(
         request,
         "alertas_credito.html",
         {
-            "vencidos": vencidos,
-            "cerca_limite": cerca_limite,
-            "excedidos": excedidos,
+            "vencidos": morosos,       # Reutiliza tus variables de 'alertas_credito.html'
+            "excedidos": bloqueados,   # Reutiliza tus variables de 'alertas_credito.html'
+            "cerca_limite": [],
             "today": today,
         },
     )
-
 
 def reportes(request):
     today = date.today()
@@ -614,70 +682,237 @@ def model_detail(request, model_name, token):
 
 
 def productos_list(request):
-    productos = []
-    for producto in Producto.objects.prefetch_related("categorias").all().order_by("nombre"):
-        resumen = _producto_stock_summary(producto)
-        productos.append({
+    lotes_productos = []
+    
+    # 1. Capturar parámetros de filtrado desde la URL (request.GET)
+    q_search = request.GET.get('q', '').strip()
+    q_proveedor = request.GET.get('proveedor', '').strip()
+    q_categoria = request.GET.get('categoria', '').strip() # <-- CAPTURAMOS LA CATEGORÍA
+    q_orden = request.GET.get('orden', 'fecha_llegada_desc') # Criterio por defecto
+
+    # 2. Construir la consulta base de llegadas
+    from django.db.models import F, Q
+    llegadas_qs = ProveedorSuministraProducto.objects.select_related("sku_producto", "rut_proveedor").all()
+    
+    # Aplicar filtro de búsqueda por texto (Nombre del producto o SKU)
+    if q_search:
+        llegadas_qs = llegadas_qs.filter(
+            Q(sku_producto__nombre__icontains=q_search) | 
+            Q(sku_producto__sku__icontains=q_search)
+        )
+        
+    # Aplicar filtro por Proveedor (RUT)
+    if q_proveedor:
+        llegadas_qs = llegadas_qs.filter(rut_proveedor__rut=q_proveedor)
+        
+    # Aplicar filtro por Categoría (id_categoria) si viene en los parámetros
+    if q_categoria:
+        llegadas_qs = llegadas_qs.filter(sku_producto__categorias__id_categoria=q_categoria)
+        
+    # Ordenamos internamente por vencimiento de forma estricta para que el FEFO consuma lo correcto
+    llegadas = llegadas_qs.order_by(F("fecha_vencimiento_lote").asc(nulls_last=True), "fecha")
+    
+    # 3. Obtenemos las ventas consolidadas de este mes
+    today = date.today()
+    start_month = today.replace(day=1)
+    
+    ventas_qs = PedidoContieneProducto.objects.filter(
+        id_pedido__fecha_de_emision__date__gte=start_month,
+        id_pedido__fecha_de_emision__date__lte=today,
+    ).values("sku").annotate(total=Sum("cantidad"))
+    
+    ventas_por_sku = {str(v["sku"]).strip(): (v["total"] or 0) for v in ventas_qs}
+
+    # 4. Aplicamos el Algoritmo FEFO secuencial
+    for llegada in llegadas:
+        producto = llegada.sku_producto
+        sku_key = str(producto.sku).strip()
+        
+        almacenamiento = BodegaAlmacenaProducto.objects.filter(sku=producto).first()
+        if almacenamiento:
+            ubicacion = f"{almacenamiento.nombre_bodega} ({almacenamiento.ubicacion_bodega})"
+            origen = almacenamiento.nombre_bodega
+        else:
+            ubicacion = "No asignado en bodega"
+            origen = "Sin origen registrado"
+        
+        cantidad_original_lote = llegada.cantidad or 0
+        ventas_pendientes = ventas_por_sku.get(sku_key, 0)
+        
+        if ventas_pendientes > 0:
+            if ventas_pendientes >= cantidad_original_lote:
+                stock_disponible = 0
+                ventas_por_sku[sku_key] -= cantidad_original_lote
+            else:
+                stock_disponible = cantidad_original_lote - ventas_pendientes
+                ventas_por_sku[sku_key] = 0
+        else:
+            stock_disponible = cantidad_original_lote
+
+        lotes_productos.append({
             "obj": producto,
-            **resumen,
+            "ubicacion": ubicacion,
+            "origen": origen,
+            "proveedor_obj": llegada.rut_proveedor,
+            "proveedor": llegada.rut_proveedor.nombre if llegada.rut_proveedor else "Sin proveedor",
+            "stock_total": cantidad_original_lote,
+            "stock_disponible": stock_disponible,
+            "fecha_vencimiento_cercana": llegada.fecha_vencimiento_lote,
+            "fecha_llegada": llegada.fecha,
+            "cantidad_lote": cantidad_original_lote,
         })
     
-    total_productos = len(productos)
-    con_stock = sum(1 for p in productos if p["stock_disponible"] > 0)
+    # 5. ORDENAMIENTO DE CARA AL USUARIO (Python side)
+    if q_orden == 'fecha_llegada_asc':
+        lotes_productos.sort(key=lambda x: x["fecha_llegada"])
+    elif q_orden == 'fecha_venc_asc':
+        lotes_productos.sort(key=lambda x: x["fecha_vencimiento_cercana"] or date(9999, 12, 31))
+    elif q_orden == 'fecha_venc_desc':
+        lotes_productos.sort(key=lambda x: x["fecha_vencimiento_cercana"] or date(1900, 1, 1), reverse=True)
+    else: 
+        lotes_productos.sort(key=lambda x: x["fecha_llegada"], reverse=True)
     
-    # Esta es la línea que fallaba, ahora ya existe la clave 'origen'
-    sin_origen = sum(1 for p in productos if p["origen"] == "Sin origen registrado")
+    # Traer listas maestras para los select del HTML
+    from .models import Proveedor, Categoria
+    proveedores = Proveedor.objects.all().order_by('nombre')
+    categorias = Categoria.objects.all().order_by('nombre') # <-- TRAEMOS LAS CATEGORÍAS
+    
+    total_productos = len(lotes_productos)
+    con_stock = sum(1 for p in lotes_productos if p["stock_disponible"] > 0)
+    sin_origen = sum(1 for p in lotes_productos if p["origen"] == "Sin origen registrado")
     
     return render(request, "producto_stock.html", {
-        "productos": productos,
+        "productos": lotes_productos,
+        "proveedores": proveedores,
+        "categorias": categorias, # <-- PASAMOS LAS CATEGORÍAS AL CONTEXTO
         "total_productos": total_productos,
         "con_stock": con_stock,
         "sin_origen": sin_origen,
+        "q_search": q_search,
+        "q_proveedor": q_proveedor,
+        "q_categoria": q_categoria, # <-- PASAMOS EL FILTRO ACTIVO
+        "q_orden": q_orden,
     })
 
 def producto_create(request):
+    # Capturamos de dónde viene el usuario para saber a dónde regresarlo
+    origen = request.GET.get('from', 'stock')
+    
     if request.method == "POST":
         form = ProductoForm(request.POST)
         if form.is_valid():
-            # 1. Guardamos el producto base en la base de datos
-            producto = form.save(commit=False)
-            producto.save()
-            form.save_m2m()  # Guarda las categorías
+            # Guarda el producto y sus categorías (Relación Many-to-Many)
+            producto = form.save() 
             
-            # 2. Recuperamos los datos de la bodega desde el ChoiceField
-            bodega_compuesta = form.cleaned_data.get("id_bodega")  # Trae "Nombre|Ubicacion"
-            cantidad_inicial = form.cleaned_data.get("cantidad_stock")
+            messages.success(request, f"Producto '{producto.nombre}' registrado exitosamente en el catálogo maestro.")
             
-            if bodega_compuesta and cantidad_inicial is not None:
-                # Separamos el nombre y la ubicación de la bodega
-                nombre_b, ubicacion_b = bodega_compuesta.split('|')
-                
-                # 3. Creamos el registro en la tabla con los nombres de campos exactos de tu modelo
-                BodegaAlmacenaProducto.objects.create(
-                    nombre_bodega=nombre_b,        # Campo CharField PK de tu modelo
-                    ubicacion_bodega=ubicacion_b,  # Campo CharField de tu modelo
-                    sku=producto,                  # Objeto Producto (Django se encarga del db_column='sku')
-                    cantidad=int(cantidad_inicial) # Convertimos a entero ya que tu modelo usa IntegerField()
-                )
-            
-            messages.success(request, "Producto creado e inventario inicial asignado correctamente.")
-            return redirect("productos-list")
+            # Redirección dinámica según de dónde provino
+            if origen == 'catalogo':
+                return redirect("productos-catalogo")
+            return redirect("stock-list")
     else:
         form = ProductoForm()
-
+        
     return render(request, "producto_form.html", {"form": form, "mode": "create"})
+
 def productos_detail(request, sku):
     producto = get_object_or_404(Producto, pk=sku)
+    origen = request.GET.get('from', 'stock')
+    
     if request.method == "POST":
         form = ProductoForm(request.POST, instance=producto)
         if form.is_valid():
-            producto = form.save(commit=False)
-            producto.save()
-            form.save_m2m()  # El mismo método aquí para las ediciones
-            messages.success(request, "Producto actualizado correctamente.")
-            return redirect("productos-list")
+            producto = form.save()
+            messages.success(request, f"Producto '{producto.nombre}' actualizado correctamente.")
+            if origen == 'catalogo':
+                return redirect("productos-catalogo")
+            return redirect("stock-list")
     else:
         form = ProductoForm(instance=producto)
+        
+    # ELIMINADO: resumen = _producto_stock_summary(producto) <-- Ya no es necesario procesarlo
+    
+    return render(request, "producto_form.html", {
+        "form": form, 
+        "mode": "edit"
+    })
 
-    resumen = _producto_stock_summary(producto)
-    return render(request, "producto_form.html", {"form": form, "mode": "edit", "resumen": resumen})
+@transaction.atomic
+def ingresar_llegada_stock(request):
+    if request.method == "POST":
+        form = LlegadaStockForm(request.POST)
+        if form.is_valid():
+            producto = form.cleaned_data["producto"]
+            proveedor = form.cleaned_data["proveedor"]
+            cantidad = int(form.cleaned_data["cantidad"]) # Tu modelo usa IntegerField para cantidad
+            fecha_llegada = form.cleaned_data["fecha_llegada"]
+            fecha_venc = form.cleaned_data["fecha_vencimiento"]
+            
+            # SEPARACIÓN DE LA BODEGA COMPUESTA
+            bodega_compuesta = form.cleaned_data["bodega"]  # String "nombre|ubicacion"
+            nombre_b, ubicacion_b = bodega_compuesta.split('|')
+            
+            sku_str = producto.sku
+            rut_str = proveedor.rut
+
+            # 1. UPSERT DIRECTO EN BODEGA_ALMACENA_PRODUCTO
+            # Si se topa con el unique_together, ejecuta la suma de la cantidad.
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO bodega_almacena_producto (nombre_bodega, ubicacion_bodega, sku, cantidad)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (nombre_bodega, ubicacion_bodega, sku) 
+                    DO UPDATE SET cantidad = bodega_almacena_producto.cantidad + EXCLUDED.cantidad;
+                """, [nombre_b, ubicacion_b, sku_str, cantidad])
+                
+            # 2. UPSERT / INSERT EN PROVEEDOR_SUMINISTRA_PRODUCTO
+            # Como tu modelo exige el campo 'cantidad' obligatorio en esta tabla también, se la inyectamos.
+            # Además usamos ON CONFLICT por si registran el mismo producto del mismo proveedor el mismo día.
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO proveedor_suministra_producto (rut_proveedor, sku_producto, fecha, fecha_vencimiento_lote, cantidad)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (rut_proveedor, sku_producto, fecha)
+                    DO UPDATE SET cantidad = proveedor_suministra_producto.cantidad + EXCLUDED.cantidad,
+                                  fecha_vencimiento_lote = EXCLUDED.fecha_vencimiento_lote;
+                """, [rut_str, sku_str, fecha_llegada, fecha_venc, cantidad])
+            
+            messages.success(
+                request, 
+                f"Llegada de stock procesada con éxito. Se ingresaron {cantidad} unidades al catálogo."
+            )
+            return redirect("stock-list")
+    else:
+        form = LlegadaStockForm()
+        
+    return render(request, "llegada_stock_form.html", {"form": form})
+
+def productos_catalogo_list(request):
+    # 1. Obtener todos los productos registrados con sus categorías
+    productos_qs = Producto.objects.prefetch_related('categorias').all().order_by('nombre')
+    
+    # 2. Capturar parámetros desde la URL
+    q_search = request.GET.get('q', '').strip()
+    q_categoria = request.GET.get('categoria', '').strip() # <-- CAPTURAMOS LA CATEGORÍA
+
+    # Filtrado por texto (Nombre o SKU)
+    if q_search:
+        from django.db.models import Q
+        productos_qs = productos_qs.filter(
+            Q(nombre__icontains=q_search) | Q(sku__icontains=q_search)
+        )
+        
+    # Filtrado por Categoría (NUEVO)
+    if q_categoria:
+        productos_qs = productos_qs.filter(categorias__id_categoria=q_categoria)
+    
+    # 3. Traer la lista maestra de categorías para el selector
+    from .models import Categoria
+    categorias = Categoria.objects.all().order_by('nombre')
+        
+    return render(request, 'productos_catalogo.html', {
+        'productos': productos_qs,
+        'categorias': categorias, # <-- ENVIAMOS LAS CATEGORÍAS
+        'q_search': q_search,
+        'q_categoria': q_categoria, # <-- ENVIAMOS EL FILTRO ACTIVO
+    })
